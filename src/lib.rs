@@ -20,42 +20,42 @@ use daggy::Dag;
 // type DagrError = Box<dyn Error + 'static>;
 const DATADIR: &str = "/tmp/dagr/data";
 type DagrResult<'a> = Result<DagrResultData, DagrError>;
-type DagrGraph<'a> = Dag::<DagrNode<'a>, u32, u32>;
+type DagrGraph<'a> = Dag::<DagrNode, u32, u32>;
 
 
 fn graph<'a>() -> Result<DagrGraph<'a>, Box<dyn std::error::Error>> {
     let mut dag = DagrGraph::new();
     let name = "foo";
     let sleep = 10;
-    let cli_cmd = format!("sleep {} && echo 'hi {}' > {}.txt", sleep, name, name).as_str();
-    let root_input = Execution::new(name, cli_cmd);
+    let cli_cmd = format!("sleep {} && echo 'hi {}' > {}.txt", sleep, name, name);
+    let root_input = Execution::new(name.to_string(), cli_cmd);
     let root_idx = dag.add_node(DagrNode::List);
     dag.add_child(root_idx, 0, DagrNode::Processor(root_input));
     Ok(dag)
     
 }
 
-enum DagrNode<'a> {
+enum DagrNode {
     List,
-    Processor(Execution<'a>),
+    Processor(Execution),
 }
 
-struct Execution<'a> {
-    name: &'a str,
-    config: Config<&'a str>,
+struct Execution {
+    name: String,
+    config: Config<String>,
 }
 
-impl <'a> Execution<'a> {
-    pub fn new(name: &'a str, cli: &'a str) -> Execution<'a> {
+impl <'a> Execution {
+    pub fn new(name: String, cli: String) -> Execution {
 
-        let container_workdir = Path::new(DATADIR).join(name);
+        let container_workdir = Path::new(DATADIR).join(&name);
         let dir_string = container_workdir.to_string_lossy();
 
         return Self {
             name,
             config: Config {
-                cmd: Some(vec!["-c", cli]),
-                entrypoint: Some(vec!["sh"]),
+                cmd: Some(vec!["-c".to_string(), cli]),
+                entrypoint: Some(vec!["sh".to_string()]),
                 host_config: Some(HostConfig{
                     memory: Some(128 * 1024 * 1024),
                     cpu_quota: Some(100_000),
@@ -63,8 +63,8 @@ impl <'a> Execution<'a> {
                     binds: Some(vec![format!("{}:/workdir", dir_string)]),
                     ..Default::default()
                 }),
-                image: Some("alpine:latest"),
-                working_dir: Some("/workdir"),
+                image: Some("alpine:latest".to_string()),
+                working_dir: Some("/workdir".to_string()),
                 ..Default::default()
             }
         }
