@@ -14,7 +14,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 // use futures_util::future::FutureExt;
-use daggy::Dag;
+use daggy::{Dag, Walker};
 
 
 // type DagrError = Box<dyn Error + 'static>;
@@ -23,7 +23,7 @@ type DagrResult<'a> = Result<DagrResultData, DagrError>;
 type DagrGraph<'a> = Dag::<DagrNode, u32, u32>;
 
 
-fn graph<'a>() -> Result<DagrGraph<'a>, Box<dyn std::error::Error>> {
+fn graph<'a>() -> Result<(DagrGraph<'a>, daggy::NodeIndex), Box<dyn std::error::Error>> {
     let mut dag = DagrGraph::new();
     let name = "foo";
     let sleep = 10;
@@ -31,8 +31,7 @@ fn graph<'a>() -> Result<DagrGraph<'a>, Box<dyn std::error::Error>> {
     let root_input = Execution::new(name.to_string(), cli_cmd);
     let root_idx = dag.add_node(DagrNode::List);
     dag.add_child(root_idx, 0, DagrNode::Processor(root_input));
-    Ok(dag)
-    
+    Ok((dag, root_idx))
 }
 
 enum DagrNode {
@@ -42,6 +41,7 @@ enum DagrNode {
 
 struct Execution {
     name: String,
+    workdir: String,
     config: Config<String>,
 }
 
@@ -53,6 +53,7 @@ impl <'a> Execution {
 
         return Self {
             name,
+            workdir: dir_string.to_string(),
             config: Config {
                 cmd: Some(vec!["-c".to_string(), cli]),
                 entrypoint: Some(vec!["sh".to_string()]),
@@ -112,75 +113,73 @@ struct DagrResultData {
     files: Vec<DagrFile>,
 }
 
-async fn execute_container<'a>(docker: &Docker, name: String, sleep: u8) -> DagrResult<'a> {
-    let container_workdir = Path::new(DATADIR).join(name.as_str());
-    let dir_string = container_workdir.to_string_lossy();
-    fs::create_dir_all(&container_workdir).await?;
+async fn process_graph(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
+    let docker = Docker::connect_with_local_defaults().unwrap();
+    let (dag, idx) = graph().unwrap();
+    for (e, n) in dag.children(idx).iter(&dag) {
+        match &dag[n] {
+            DagrNode::Processor(e) => {
+                let result = execute_container(&docker, e);
+            },
+            _ => unreachable!(),
+        };
+    }
+    Ok(())
+}
+
+async fn execute_container<'a>(docker: &Docker, execution: &'a Execution) -> DagrResult<'a> {
+    // let container_workdir = Path::new(DATADIR).join(name.as_str());
+    // let dir_string = container_workdir.to_string_lossy();
 
     let opts = CreateContainerOptions {
-        name: name.as_str(),
-    };
-    let cli_cmd = format!("sleep {} && echo 'hi {}' > {}.txt", sleep, name, name);
-    let config = Config {
-        cmd: Some(vec!["-c", cli_cmd.as_str()]),
-        entrypoint: Some(vec!["sh"]),
-        host_config: Some(HostConfig{
-            memory: Some(128 * 1024 * 1024),
-            cpu_quota: Some(100_000),
-            cpu_period: Some(100_000),
-            binds: Some(vec![format!("{}:/workdir", dir_string)]),
-            ..Default::default()
-        }),
-        image: Some("alpine:latest"),
-        working_dir: Some("/workdir"),
-        ..Default::default()
+        name: execution.name.as_str(),
     };
 
-    docker.create_container(Some(opts), config).await?;
-    println!("Before start ({})", name);
-    docker.start_container(&name, None::<StartContainerOptions<String>>).await?;
-    println!("After start ({})", name);
+    docker.create_container(Some(opts), execution.config).await?;
+    println!("Before start ({})", execution.name);
+    docker.start_container(&execution.name, None::<StartContainerOptions<String>>).await?;
+    println!("After start ({})", execution.name);
     let wait_opts = Some(WaitContainerOptions { condition: "not-running" });
-    let responses = docker.wait_container(&name, wait_opts).try_collect::<Vec<_>>().await?;
+    let responses = docker.wait_container(&execution.name, wait_opts).try_collect::<Vec<_>>().await?;
 
     let response = &responses[0];
 
     let result = DagrResultData {
-        name,
+        name: execution.name,
         exit_code: response.status_code,
-        files: vec![DagrFile { path: dir_string.to_string(), size: 0, checksum: 0 }],
+        files: vec![DagrFile { path: execution.workdir, size: 0, checksum: 0 }],
     };
 
     Ok(result)
 }
 
-async fn run_all() -> Result<(), DagrError> {
-    // let tasks = (0..10).map(|i| execute_container(&docker, i.to_string().as_str())).collect::<Vec<Future<Output=DagrResult>>>>();
-    let mut tasks = vec![];
-    for i in 0..10 {
-        // let name = i.to_string();
-        let task = tokio::spawn(async move {
-            let name = format!("container-{}", i);
-            let docker = Docker::connect_with_local_defaults().unwrap();
-            execute_container(&docker, name.to_string(), 5).await.unwrap()
-        });
-        tasks.push(task);
-    }
+// async fn run_all() -> Result<(), DagrError> {
+//     // let tasks = (0..10).map(|i| execute_container(&docker, i.to_string().as_str())).collect::<Vec<Future<Output=DagrResult>>>>();
+//     let mut tasks = vec![];
+//     for i in 0..10 {
+//         // let name = i.to_string();
+//         let task = tokio::spawn(async move {
+//             let name = format!("container-{}", i);
+//             let docker = Docker::connect_with_local_defaults().unwrap();
+//             execute_container(&docker, name.to_string(), 5).await.unwrap()
+//         });
+//         tasks.push(task);
+//     }
 
-    let task = tokio::spawn(async move {
-        let docker = Docker::connect_with_local_defaults().unwrap();
-        execute_container(&docker, "foo".to_string(), 1).await.unwrap()
-    });
-    tasks.push(task);
+//     let task = tokio::spawn(async move {
+//         let docker = Docker::connect_with_local_defaults().unwrap();
+//         execute_container(&docker, "foo".to_string(), 1).await.unwrap()
+//     });
+//     tasks.push(task);
 
-    for task in tasks.drain(..) {
-        let result = task.await.unwrap();
-        println!("Container {} exit code: {} ({:?})", result.name, result.exit_code, result.files);
-    }  
+//     for task in tasks.drain(..) {
+//         let result = task.await.unwrap();
+//         println!("Container {} exit code: {} ({:?})", result.name, result.exit_code, result.files);
+//     }  
 
-    println!("Done");
-    Ok(())
-}
+//     println!("Done");
+//     Ok(())
+// }
 
 #[cfg(test)]
 mod tests {
