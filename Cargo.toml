@@ -3,6 +3,14 @@ name = "dagr"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "dagr"
+path = "src/lib/lib.rs"
+
+[[bin]]
+name = "dagr"
+path = "src/bin/bin.rs"
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -10,3 +18,8 @@ bollard = "0.11.1"
 daggy = "0.8.0"
 futures-util = "0.3.19"
 tokio = { version = "1.16.1", features = ["full"] }
+minijinja = { version = "0.15.0", features = ["source"] }
+serde = { version = "1.0.136", features = ["serde_derive"] }
+async-recursion = "1.0.0"
+
+[features]
