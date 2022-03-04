@@ -23,14 +23,18 @@ type DagrResult<'a> = Result<DagrResultData, DagrError>;
 type DagrGraph<'a> = Dag::<DagrNode, u32, u32>;
 
 
-fn graph<'a>() -> Result<(DagrGraph<'a>, daggy::NodeIndex), Box<dyn std::error::Error>> {
+fn graph() -> Result<(DagrGraph<'static>, daggy::NodeIndex), Box<dyn std::error::Error>> {
     let mut dag = DagrGraph::new();
-    let name = "foo";
-    let sleep = 10;
-    let cli_cmd = format!("sleep {} && echo 'hi {}' > {}.txt", sleep, name, name);
-    let root_input = Execution::new(name.to_string(), cli_cmd);
+    let names = vec!["foo", "bar", "baz"];
+    let sleep = 1;
     let root_idx = dag.add_node(DagrNode::List);
-    dag.add_child(root_idx, 0, DagrNode::Processor(root_input));
+
+    for (i, name) in names.iter().enumerate() {
+        let cli_cmd = format!("sleep {} && echo 'hi {}' > {}.txt", sleep, name, name);
+        let root_input = Execution::new(name.to_string(), cli_cmd);
+        dag.add_child(root_idx, i.try_into()?, DagrNode::Processor(root_input));
+    }
+
     Ok((dag, root_idx))
 }
 
@@ -41,33 +45,20 @@ enum DagrNode {
 
 struct Execution {
     name: String,
+    cli: String,
     workdir: String,
-    config: Config<String>,
 }
 
 impl <'a> Execution {
-    pub fn new(name: String, cli: String) -> Execution {
+    pub fn new(name: String, cli: String) -> Self {
 
         let container_workdir = Path::new(DATADIR).join(&name);
         let dir_string = container_workdir.to_string_lossy();
 
-        return Self {
+        Self {
             name,
+            cli,
             workdir: dir_string.to_string(),
-            config: Config {
-                cmd: Some(vec!["-c".to_string(), cli]),
-                entrypoint: Some(vec!["sh".to_string()]),
-                host_config: Some(HostConfig{
-                    memory: Some(128 * 1024 * 1024),
-                    cpu_quota: Some(100_000),
-                    cpu_period: Some(100_000),
-                    binds: Some(vec![format!("{}:/workdir", dir_string)]),
-                    ..Default::default()
-                }),
-                image: Some("alpine:latest".to_string()),
-                working_dir: Some("/workdir".to_string()),
-                ..Default::default()
-            }
         }
     }
 }
@@ -113,29 +104,46 @@ struct DagrResultData {
     files: Vec<DagrFile>,
 }
 
-async fn process_graph(docker: &Docker) -> Result<(), Box<dyn std::error::Error>> {
-    let docker = Docker::connect_with_local_defaults().unwrap();
+async fn process_graph() -> Result<(), Box<dyn std::error::Error>> {
     let (dag, idx) = graph().unwrap();
-    for (e, n) in dag.children(idx).iter(&dag) {
-        match &dag[n] {
-            DagrNode::Processor(e) => {
-                let result = execute_container(&docker, e);
-            },
-            _ => unreachable!(),
-        };
-    }
+    let static_dag_ref: &'static DagrGraph<'static> = &'static dag;
+    // for (_e, n) in dag.children(idx).iter(&dag) {
+    //     match &dag[n] {
+    //         DagrNode::Processor(execution) => {
+    //             tokio::spawn(async move {
+    //                 execute_container(execution)
+    //             }).await.unwrap();
+    //         },
+    //         _ => unreachable!(),
+    //     };
+    // }
     Ok(())
 }
 
-async fn execute_container<'a>(docker: &Docker, execution: &'a Execution) -> DagrResult<'a> {
+async fn execute_container<'a>(execution: &'a Execution) -> DagrResult<'a> {
     // let container_workdir = Path::new(DATADIR).join(name.as_str());
     // let dir_string = container_workdir.to_string_lossy();
 
+    let docker = Docker::connect_with_local_defaults()?;
     let opts = CreateContainerOptions {
         name: execution.name.as_str(),
     };
 
-    docker.create_container(Some(opts), execution.config).await?;
+    let config = Config {
+        cmd: Some(vec!["-c".to_string(), execution.cli.clone()]),
+        entrypoint: Some(vec!["sh".to_string()]),
+        host_config: Some(HostConfig{
+            memory: Some(128 * 1024 * 1024),
+            cpu_quota: Some(100_000),
+            cpu_period: Some(100_000),
+            binds: Some(vec![format!("{}:/workdir", execution.workdir)]),
+            ..Default::default()
+        }),
+        image: Some("alpine:latest".to_string()),
+        working_dir: Some("/workdir".to_string()),
+        ..Default::default()
+    };
+    docker.create_container(Some(opts), config).await?;
     println!("Before start ({})", execution.name);
     docker.start_container(&execution.name, None::<StartContainerOptions<String>>).await?;
     println!("After start ({})", execution.name);
@@ -145,9 +153,9 @@ async fn execute_container<'a>(docker: &Docker, execution: &'a Execution) -> Dag
     let response = &responses[0];
 
     let result = DagrResultData {
-        name: execution.name,
+        name: execution.name.clone(),
         exit_code: response.status_code,
-        files: vec![DagrFile { path: execution.workdir, size: 0, checksum: 0 }],
+        files: vec![DagrFile { path: execution.workdir.clone(), size: 0, checksum: 0 }],
     };
 
     Ok(result)
@@ -184,10 +192,10 @@ async fn execute_container<'a>(docker: &Docker, execution: &'a Execution) -> Dag
 #[cfg(test)]
 mod tests {
     use super::*;
-    // #[tokio::test]
-    // async fn it_works() {
-    //     run_all().await.unwrap();
-    // }
+    #[tokio::test]
+    async fn it_works() {
+        process_graph().await.unwrap();
+    }
 
     #[test]
     fn test_dag() {
