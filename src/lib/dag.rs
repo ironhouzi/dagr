@@ -171,7 +171,7 @@ fn input_files(_state: &State, value: Vec<String>) -> Result<String, minijinja::
     Ok(value.join(" "))
 }
 
-async fn execute_container<'a, 'b>(execution: &'a Execution, input: &'b DagrInput) -> DagrResult {
+async fn execute_container(execution: &Execution, input: &DagrInput<'_>) -> DagrResult {
     
     // let container_workdir = Path::new(DATADIR).join(name.as_str());
     // let dir_string = container_workdir.to_string_lossy();
