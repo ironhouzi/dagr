@@ -30,7 +30,7 @@ use crate::error::DagrError;
 const DATADIR: &str = "/tmp/dagr/data";
 const SLEEP: u32 = 4;
 
-pub type DagrResult<'a> = Result<DagrData, DagrError>;
+pub type DagrResult<'a> = Result<DagrData<'a>, DagrError>;
 type DagrGraph = Dag::<DagrNode, DagrEdge, u32>;
 type DagrInput<'a> = HashMap<&'a str, DagrValue>;
 
@@ -87,8 +87,8 @@ impl Display for DagrFile {
 }
 
 #[derive(Debug)]
-pub struct DagrData {
-    name: String,
+pub struct DagrData<'a> {
+    name: &'a str,
     exit_code: i64,
     files: Vec<DagrFile>,
 }
@@ -142,7 +142,7 @@ async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult {
                     match process_graph(dag, child_idx).await {
                         Ok(data) => {
                             input.insert(
-                                &data.name,
+                                data.name,
                                 DagrValue::Files(data.files.iter().map(|f| f.to_string()).collect())
                             );
                         },
@@ -171,7 +171,7 @@ fn input_files(_state: &State, value: Vec<String>) -> Result<String, minijinja::
     Ok(value.join(" "))
 }
 
-async fn execute_container<'a, 'b>(execution: &Execution, input: &DagrInput<'b>) -> DagrResult<'a> {
+async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'b>) -> DagrResult<'a> {
     
     // let container_workdir = Path::new(DATADIR).join(name.as_str());
     // let dir_string = container_workdir.to_string_lossy();
@@ -217,7 +217,7 @@ async fn execute_container<'a, 'b>(execution: &Execution, input: &DagrInput<'b>)
     let response = &responses[0];
 
     Ok(DagrData {
-        name: execution.name.clone(),
+        name: &execution.name,
         exit_code: response.status_code,
         files: std::fs::read_dir(execution.workdir.clone())?
             .map(|res| res.map(|dir| dir.path().to_string_lossy().to_string()))
