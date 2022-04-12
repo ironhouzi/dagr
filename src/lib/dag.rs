@@ -14,6 +14,7 @@ use bollard::container::{
     WaitContainerOptions,
 };
 use bollard::models::HostConfig;
+use daggy::petgraph::graph::node_index;
 use daggy::{Dag, Walker};
 // use futures_util::Future;
 // use tokio::fs;
@@ -47,6 +48,7 @@ enum DagrNode {
     Processor(Execution),
 }
 
+#[derive(Debug)]
 enum DagrEdge {
     Resolved(daggy::NodeIndex),
     Unresolved,
@@ -123,7 +125,7 @@ fn chain_graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Er
     let root_idx = dag.add_node(DagrNode::Processor(i_input));
 
     let name = "first";
-    let inner_cmd = "echo 'world' > foo.txt";
+    let inner_cmd = "echo \"world\" > foo.txt";
     let input = Execution::new(name.to_string(), inner_cmd.to_string());
     let edge = DagrEdge::Unresolved;
     dag.add_child(root_idx, edge, DagrNode::Processor(input));
@@ -132,32 +134,34 @@ fn chain_graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Er
 }
 
 #[async_recursion(?Send)]
-async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult {
-    // let mut executions: Vec<(&Execution, &DagrInput)> = vec!();
+async fn process_graph(dag: &mut DagrGraph, idx: daggy::NodeIndex) -> DagrResult {
     let mut input: DagrInput = HashMap::new();
-    for (e, n) in dag.children(idx).iter(&dag) {
-        match &dag[n] {
-            DagrNode::Processor(exec) => {
-                if let Some((_, child_idx)) = dag.edge_endpoints(e) {
-                    match process_graph(dag, child_idx).await {
-                        Ok(data) => {
-                            input.insert(
-                                data.name,
-                                DagrValue::Files(data.files.iter().map(|f| f.to_string()).collect())
-                            );
-                        },
-                        Err(_) => unreachable!(),
-                    };
-                };
+    for (e, n) in dag.children(idx).iter(dag) {
+        match dag.edge_weight(e) {
+            Some(DagrEdge::Unresolved) => {
+                match &mut dag[n] {
+                    DagrNode::Processor(_exec) => {
+                        if let Some((parent_idx, child_idx)) = dag.edge_endpoints(e) {
+                            if let Ok(data) = process_graph(dag, child_idx).await {
+                                input.insert(
+                                    data.name,
+                                    DagrValue::Files(
+                                        data.files.iter()
+                                        .map(|f| f.to_string())
+                                        .collect()
+                                    )
+                                );
+                                dag.update_edge(parent_idx, child_idx, DagrEdge::Resolved(child_idx));
+                            };
+                        };
 
-                // executions.push((exec, &input))
+                    },
+                    _ => unreachable!(),
+                };
             },
-            _ => unreachable!(),
-        };
+            _ => continue
+        }
     }
-    // let futs = executions.iter().map(|(e, i)| execute_container(e, i));
-    // join_all(futs).await/*.map(|data| )*/;
-    // println!("{results:?}");
     match &dag[idx] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
@@ -347,9 +351,9 @@ mod tests {
     // }
 
     #[tokio::test]
-    async fn it_works() {
-        let (dag, root_idx) = chain_graph().unwrap();
-        process_graph(&dag, root_idx).await.unwrap();
+    async fn test_chained() {
+        let (mut dag, root_idx) = chain_graph().unwrap();
+        process_graph(&mut dag, root_idx).await.unwrap();
     }
 
     // #[test]
