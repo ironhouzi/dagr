@@ -18,7 +18,6 @@ use bollard::models::HostConfig;
 // use daggy::petgraph::graph::node_index;
 use daggy::{Dag, Walker};
 // use futures_util::Future;
-// use tokio::fs;
 
 // use std::hash::Hash;
 use futures_util::stream::TryStreamExt;
@@ -119,6 +118,7 @@ pub struct DagrData<'a> {
 #[async_recursion(?Send)]
 pub async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult {
     let mut input: DagrInput = HashMap::new();
+
     for (e, n) in dag.children(idx).iter(dag) {
         if let Some(edge) = dag.edge_weight(e) {
             match edge.get() {
@@ -248,13 +248,14 @@ mod tests {
         let static_execution = Execution::new(name.to_string(), "echo foo".to_string());
         let input = DagrInput::new();
         let result = execute_container(&static_execution, &input).await;
-        let docker = Docker::connect_with_local_defaults().unwrap();
-        docker.remove_container(name, Some(RemoveContainerOptions{ force: true, ..Default::default()})).await.unwrap();
         match result {
             Ok(r) => assert_eq!(r.exit_code, 0),
-            Err(e) => panic!("{e}"),
+            Err(e) => {
+                cleanup(vec!(name.to_owned())).await?;
+                panic!("{e}")
+            },
         };
-        clean_datadir(name).await?;
+        cleanup(vec!(name.to_owned())).await?;
         Ok(())
     }
 
@@ -270,22 +271,18 @@ mod tests {
         assert_eq!(info.args, Some(vec!["-c".to_string(), "echo dynamic".to_string()]));
         // TODO: learn streams
         // docker.logs(name, Some(LogsOptions { stdout: true, ..Default::default() })).try_collect();
-        docker.remove_container(name, Some(RemoveContainerOptions{ force: true, ..Default::default()})).await.unwrap();
         match result {
             Ok(r) => {
                 assert_eq!(r.exit_code, 0);
             },
-            Err(e) => panic!("{e}"),
+            Err(e) => {
+                cleanup(vec!(name.to_owned())).await?;
+                panic!("{e}")
+            },
         };
-        clean_datadir(name).await?;
+        cleanup(vec!(name.to_owned())).await?;
         Ok(())
     }
-
-    // TODO: test chained nodes with two intermediary files
-    // #[tokio::test]
-    // async fn test_dynamic_files() -> Result<(), Box<dyn std::error::Error>> {
-    //     Ok(())
-    // }
 
     #[tokio::test]
     async fn test_single_static_file_output() -> Result<(), Box<dyn std::error::Error>> {
@@ -293,16 +290,18 @@ mod tests {
         let execution = Execution::new(name.to_string(), "echo foo > output.txt".to_string());
         let input = DagrInput::new();
         let result = execute_container(&execution, &input).await;
-        let docker = Docker::connect_with_local_defaults().unwrap();
-        docker.remove_container(name, Some(RemoveContainerOptions{ force: true, ..Default::default()})).await.unwrap();
-        match result {
+        let verification = match result {
             Ok(r) => {
-                assert_eq!(r.exit_code, 0);
-                assert_eq!(r.files[0].path, PathBuf::from(format!("{}/output.txt", execution.workdir)));
+                r.exit_code.eq(&0) &&
+                r.files[0].path.eq(&PathBuf::from(format!("{}/output.txt", execution.workdir)))
             },
-            Err(e) => panic!("{e}"),
+            Err(e) => {
+                cleanup(vec!(name.to_owned())).await?;
+                panic!("{e}")
+            },
         };
-        clean_datadir(name).await?;
+        cleanup(vec!(name.to_owned())).await?;
+        assert!(verification);
         Ok(())
     }
 
@@ -325,68 +324,74 @@ mod tests {
 
         let (dag, root_idx) = chain_graph().unwrap();
         let result = process_graph(&dag, root_idx).await;
-        verify_result(result, "hello world\n");
-        cleanup(&dag).await?;
+        let verification = verify_result(result, "hello world\n").unwrap_or(false);
+        cleanup(dag_containers(&dag)?).await?;
+        assert!(verification);
         Ok(())
     }
 
-    fn verify_result(result: DagrResult, valid_file_content: &str) -> Result<(), DagrError> {
+    fn verify_result(result: DagrResult, valid_file_content: &str) -> Result<bool, DagrError> {
         let r = result?;
         let result_file = &r.files[0].path;
         assert_eq!(r.exit_code, 0);
         assert_eq!(result_file, &PathBuf::from(format!("{}/{}/foo.txt", DATADIR, r.name)));
         let file_content = std::fs::read_to_string(result_file)?;
         assert_eq!(file_content, valid_file_content);
-        Ok(())
+        Ok(true)
     }
 
     async fn clean_datadir(container_name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let cleanup_container = format!("cleanup_{}", container_name);
         let docker = Docker::connect_with_local_defaults()?;
         let opts = CreateContainerOptions {
-            name: container_name,
+            name: &cleanup_container,
         };
+        let cmd = format!("rm -rf {}", container_name);
         let config: Config<&str> = Config {
-            cmd: Some(vec!["-c", "rm -rf /data"]),
+            cmd: Some(vec!["-c", &cmd]),
             entrypoint: Some(vec!["sh"]),
             host_config: Some(HostConfig{
                 auto_remove: Some(true),
                 cpu_quota: Some(100_000),
                 cpu_period: Some(100_000),
-                binds: Some(vec!(format!("{}/{}:/data", DATADIR, container_name))),
+                binds: Some(vec!(format!("{}:/data", DATADIR))),
                 memory: Some(128 * 1024 * 1024),
                 ..Default::default()
             }),
             image: Some("alpine:latest"),
+            working_dir: Some("/data"),
             ..Default::default()
         };
         docker.create_container(Some(opts), config).await?;
-        docker.start_container(container_name, None::<StartContainerOptions<String>>).await?;
+        docker.start_container(&cleanup_container, None::<StartContainerOptions<String>>).await?;
         let wait_opts = Some(WaitContainerOptions { condition: "not-running" });
-        docker.wait_container(container_name, wait_opts).try_collect::<Vec<_>>().await?;
+        docker.wait_container(&cleanup_container, wait_opts).try_collect::<Vec<_>>().await?;
         Ok(())
     }
 
-    async fn clean_containers(dag: &DagrGraph) -> Result<(), Box<dyn std::error::Error>> {
-        let docker = Docker::connect_with_local_defaults()?;
-        let container_names = dag.raw_nodes().iter().filter_map(|node| match &node.weight {
+    fn dag_containers(dag: &DagrGraph) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        Ok(dag
+           .raw_nodes()
+           .iter()
+           .filter_map(|node| match &node.weight {
             DagrNode::Processor(execution) => Some(execution.name.clone()),
             _ => None,
-        });
+           })
+           .collect())
+    }
 
+    async fn clean_containers(container_names: &Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+        let docker = Docker::connect_with_local_defaults()?;
         let opts = Some(RemoveContainerOptions{ force: true, ..Default::default()});
         for container_name in container_names {
-            docker.remove_container(&container_name, opts).await?;
+            docker.remove_container(container_name, opts).await?;
         }
 
         Ok(())
     }
 
-    async fn cleanup(dag: &DagrGraph) -> Result<(), Box<dyn std::error::Error>> {
-        clean_containers(dag).await?;
-        let container_names = dag.raw_nodes().iter().filter_map(|node| match &node.weight {
-            DagrNode::Processor(execution) => Some(execution.name.clone()),
-            _ => None,
-        });
+    async fn cleanup(container_names: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+        clean_containers(&container_names).await?;
         for container_name in container_names {
             clean_datadir(&container_name).await?;
         }
