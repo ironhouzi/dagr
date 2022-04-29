@@ -125,31 +125,35 @@ pub async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult
             None => continue,
         };
 
-        match edge.get() {
-            DagrEdge::Resolved => continue,
-            DagrEdge::Unresolved => {
-                match &dag[n] {
-                    DagrNode::Processor(_exec) => {
-                        let (_, child_idx) = match dag.edge_endpoints(e) {
-                            Some(tuple) => tuple,
-                            None => continue,
-                        };
-                        let data = process_graph(dag, child_idx).await?;
-                        input.insert(
-                            data.name,
-                            DagrValue::Files(
-                                data.files.iter().map(|f| f.path.clone()).collect()
-                            )
-                        );
-                        // Used simple solution of interior mutability, which should be
-                        // fine assuming docker containers are async and will not need
-                        // threads to handle execution.
-                        edge.set(DagrEdge::Resolved);
-                    },
-                    _ => unreachable!(),
-                };
-            },
+        let skip = match edge.get() {
+            DagrEdge::Resolved => true,
+            DagrEdge::Unresolved => false,
+        };
+
+        if skip {
+            continue
         }
+
+        match &dag[n] {
+            DagrNode::Processor(_exec) => {
+                let (_, child_idx) = match dag.edge_endpoints(e) {
+                    Some(tuple) => tuple,
+                    None => continue,
+                };
+                let data = process_graph(dag, child_idx).await?;
+                input.insert(
+                    data.name,
+                    DagrValue::Files(
+                        data.files.iter().map(|f| f.path.clone()).collect()
+                    )
+                );
+                // Used simple solution of interior mutability, which should be
+                // fine assuming docker containers are async and will not need
+                // threads to handle execution.
+                edge.set(DagrEdge::Resolved);
+            },
+            _ => unreachable!(),
+        };
     }
 
     match &dag[idx] {
