@@ -147,6 +147,7 @@ pub async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult
             }
         }
     }
+
     match &dag[idx] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
@@ -196,10 +197,11 @@ async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'
                             "{}:/inputs/{}:ro",
                             file.to_string_lossy(),
                             file.file_name().unwrap().to_string_lossy()))
-                    .collect())
+                    .collect::<Vec<String>>())
             },
             _ => None,
         })
+        .flatten()
         .collect();
 
     binds.push(format!("{}:/workdir", execution.workdir));
@@ -241,6 +243,23 @@ async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'
 mod tests {
     use super::*;
     use bollard::container::{RemoveContainerOptions, InspectContainerOptions};
+
+    // From sebk (matrix):
+    // ------------
+    // a thread that takes Box<dyn Drop>
+    // (via a channel)
+    // sending things in a drop handler is a fairly low risk operation and then the other thread can deal with panics
+    // ------------
+    // It isn't a very elelegant solution, but it should work and not blow up in your face all the time because a drop handler paniced inside a panic handler
+    // a global Reciever<Box<dyn Drop>>
+    // then everything you want drop drop via that channel is wrapped in Options, so you can Option::take it in the &mut self drop handler
+    // take the value, unwrap and Box it
+    // then send it via the channel
+    // the dedicated thread simply reads from the channel in a loop and does nothing else
+    // just read and discard
+    // or read and drop in catch_unwind, if your drop handlers panic a lot
+    // ------------
+    // REQUIRES TEST LIB TO START THREAD! :(
 
     #[tokio::test]
     async fn test_single_static_execution() -> Result<(), Box<dyn std::error::Error>> {
@@ -325,6 +344,32 @@ mod tests {
         let (dag, root_idx) = chain_graph().unwrap();
         let result = process_graph(&dag, root_idx).await;
         let verification = verify_result(result, "hello world\n").unwrap_or(false);
+        cleanup(dag_containers(&dag)?).await?;
+        assert!(verification);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multifile_chain() -> Result<(), Box<dyn std::error::Error>> {
+        fn chain_graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Error>> {
+            let mut dag = DagrGraph::new();
+
+            let name = "chain2_last";
+            let i_input = Execution::new(name.to_string(), "cat {{ fetch_files(chain2_first) }} > foo.txt".to_string());
+            let root_idx = dag.add_node(DagrNode::Processor(i_input));
+
+            let name = "chain2_first";
+            let inner_cmd = "echo 'hello' > hello.txt; echo 'world' > world.txt;";
+            // let inner_cmd = "echo world > world.txt; echo hello > hello.txt;";
+            let input = Execution::new(name.to_string(), inner_cmd.to_string());
+            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+
+            Ok((dag, root_idx))
+        }
+
+        let (dag, root_idx) = chain_graph().unwrap();
+        let result = process_graph(&dag, root_idx).await;
+        let verification = verify_result(result, "world\nhello\n").unwrap_or(false);
         cleanup(dag_containers(&dag)?).await?;
         assert!(verification);
         Ok(())
