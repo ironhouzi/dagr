@@ -120,31 +120,35 @@ pub async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult
     let mut input: DagrInput = HashMap::new();
 
     for (e, n) in dag.children(idx).iter(dag) {
-        if let Some(edge) = dag.edge_weight(e) {
-            match edge.get() {
-                DagrEdge::Unresolved => {
-                    match &dag[n] {
-                        DagrNode::Processor(_exec) => {
-                            if let Some((_, child_idx)) = dag.edge_endpoints(e) {
-                                if let Ok(data) = process_graph(dag, child_idx).await {
-                                    input.insert(
-                                        data.name,
-                                        DagrValue::Files(
-                                            data.files.iter().map(|f| f.path.clone()).collect()
-                                        )
-                                    );
-                                    // Used simple solution of interior mutability, which should be
-                                    // fine assuming docker containers are async and will not need
-                                    // threads to handle execution.
-                                    edge.set(DagrEdge::Resolved);
-                                };
-                            };
-                        },
-                        _ => unreachable!(),
-                    };
-                },
-                DagrEdge::Resolved => continue
-            }
+        let edge = match dag.edge_weight(e) {
+            Some(edge_data) => edge_data,
+            None => continue,
+        };
+
+        match edge.get() {
+            DagrEdge::Resolved => continue,
+            DagrEdge::Unresolved => {
+                match &dag[n] {
+                    DagrNode::Processor(_exec) => {
+                        let (_, child_idx) = match dag.edge_endpoints(e) {
+                            Some(tuple) => tuple,
+                            None => continue,
+                        };
+                        let data = process_graph(dag, child_idx).await?;
+                        input.insert(
+                            data.name,
+                            DagrValue::Files(
+                                data.files.iter().map(|f| f.path.clone()).collect()
+                            )
+                        );
+                        // Used simple solution of interior mutability, which should be
+                        // fine assuming docker containers are async and will not need
+                        // threads to handle execution.
+                        edge.set(DagrEdge::Resolved);
+                    },
+                    _ => unreachable!(),
+                };
+            },
         }
     }
 
