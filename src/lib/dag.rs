@@ -62,7 +62,7 @@ pub enum DagrNode {
     Processor(Execution),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum DagrEdge {
     Resolved,
     Unresolved,
@@ -116,47 +116,39 @@ pub struct DagrData<'a> {
 }
 
 #[async_recursion(?Send)]
-pub async fn process_graph(dag: &DagrGraph, idx: daggy::NodeIndex) -> DagrResult {
+pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> DagrResult {
     let mut input: DagrInput = HashMap::new();
 
-    for (e, n) in dag.children(idx).iter(dag) {
-        let edge = match dag.edge_weight(e) {
-            Some(edge_data) => edge_data,
+    for (child_edge_index, child_node_index) in dag.children(node_index).iter(dag) {
+        let edge_data = match dag.edge_weight(child_edge_index) {
+            Some(edge) => edge,
             None => continue,
         };
 
-        let skip = match edge.get() {
-            DagrEdge::Resolved => true,
-            DagrEdge::Unresolved => false,
-        };
-
-        if skip {
+        if edge_data.get() == DagrEdge::Resolved {
             continue
         }
 
-        match &dag[n] {
-            DagrNode::Processor(_exec) => {
-                let (_, child_idx) = match dag.edge_endpoints(e) {
-                    Some(tuple) => tuple,
-                    None => continue,
-                };
-                let data = process_graph(dag, child_idx).await?;
+        match &dag[child_node_index] {
+            DagrNode::Processor(_) => {
+                let result = process_graph(dag, child_node_index).await?;
                 input.insert(
-                    data.name,
-                    DagrValue::Files(
-                        data.files.iter().map(|f| f.path.clone()).collect()
-                    )
+                    result.name,
+                    DagrValue::Files(result.files
+                                     .iter()
+                                     .map(|f| f.path.clone())
+                                     .collect())
                 );
                 // Used simple solution of interior mutability, which should be
                 // fine assuming docker containers are async and will not need
                 // threads to handle execution.
-                edge.set(DagrEdge::Resolved);
+                edge_data.set(DagrEdge::Resolved);
             },
             _ => unreachable!(),
         };
     }
 
-    match &dag[idx] {
+    match &dag[node_index] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
         },
