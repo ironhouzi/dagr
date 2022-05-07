@@ -31,26 +31,44 @@ use crate::error::DagrError;
 const DATADIR: &str = "/tmp/dagr/data";
 // const SLEEP: u32 = 4;
 
-pub type DagrResult<'a> = Result<DagrData<'a>, DagrError>;
-type DagrGraph = Dag::<DagrNode, Cell<DagrEdge>, u32>;
-type DagrInput<'a> = HashMap<&'a str, DagrValue>;
+pub type GraphResult<'a> = Result<GraphOutput<'a>, DagrError>;
+type DagrGraph = Dag::<DagrNode, DagrEdge, u32>;
+type DagrInput<'a> = HashMap<&'a str, Vec<DagrValue>>;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
+pub enum GraphOutput<'a> {
+    Execution(ExecutionOutput<'a>),
+    List((&'a str, Vec<DagrValue>)),
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
-enum DagrValue {
+pub enum DagrValue {
     Literal(String),
-    Files(Vec<PathBuf>),
+    File(PathBuf),
 }
 
 impl Display for DagrValue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DagrValue::Literal(literal) => write!(f, "{}", literal),
-            DagrValue::Files(paths) => write!(f, "{}", paths
-                .iter()
-                .map(|path| format!("/inputs/{}", path.file_name().unwrap().to_string_lossy()))
-                .collect::<Vec<String>>()
-                .join(" ")
+            DagrValue::File(path) => write!(
+                f,
+                "/inputs/{}",
+                path.file_name().unwrap().to_string_lossy(),
+            ),
+        }
+    }
+}
+
+impl DagrValue {
+    fn bind_mount(&self) -> String {
+        match &self {
+            DagrValue::Literal(s) => s.to_string(),
+            DagrValue::File(path) => format!(
+                "{}:{}:ro",
+                path.to_string_lossy(),
+                &self.to_string(),
             ),
         }
     }
@@ -58,30 +76,43 @@ impl Display for DagrValue {
 
 #[derive(Debug)]
 pub enum DagrNode {
-    List,
-    Processor(Execution),
+    List(String),
+    Processor(ExecutionInput),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DagrEdge {
+enum EdgeState {
     Resolved,
     Unresolved,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct DagrEdge {
+    // Used simple solution of interior mutability, which should be fine assuming docker containers
+    // are async and will not traverse thread boundaries to handle execution.
+    state: Cell<EdgeState>,
+}
+
 impl DagrEdge {
-    pub fn new() -> Cell<Self> {
-        Cell::new(DagrEdge::Unresolved)
+    pub fn new() -> Self {
+        Self { state: Cell::new(EdgeState::Unresolved) }
+    }
+}
+
+impl Default for DagrEdge {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct Execution {
+pub struct ExecutionInput {
     cmd: String,
     name: String,
     workdir: String,
 }
 
-impl Execution {
+impl ExecutionInput {
     pub fn new(name: String, cmd: String) -> Self {
 
         let container_workdir = Path::new(DATADIR).join(&name);
@@ -109,14 +140,14 @@ impl Display for DagrFile {
 }
 
 #[derive(Debug)]
-pub struct DagrData<'a> {
+pub struct ExecutionOutput<'a> {
     name: &'a str,
     exit_code: i64,
     files: Vec<DagrFile>,
 }
 
 #[async_recursion(?Send)]
-pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> DagrResult {
+pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> GraphResult {
     let mut input: DagrInput = HashMap::new();
 
     for (child_edge_index, child_node_index) in dag.children(node_index).iter(dag) {
@@ -125,34 +156,34 @@ pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> Dag
             None => continue,
         };
 
-        if edge_data.get() == DagrEdge::Resolved {
+        if edge_data.state.get() == EdgeState::Resolved {
             continue
         }
 
-        match &dag[child_node_index] {
-            DagrNode::Processor(_) => {
-                let result = process_graph(dag, child_node_index).await?;
+        match process_graph(dag, child_node_index).await? {
+            GraphOutput::Execution(result) => {
                 input.insert(
                     result.name,
-                    DagrValue::Files(result.files
-                                     .iter()
-                                     .map(|f| f.path.clone())
-                                     .collect())
+                    result.files
+                        .iter()
+                        .map(|f| DagrValue::File(f.path.clone()))
+                        .collect()
                 );
-                // Used simple solution of interior mutability, which should be
-                // fine assuming docker containers are async and will not need
-                // threads to handle execution.
-                edge_data.set(DagrEdge::Resolved);
             },
-            _ => unreachable!(),
-        };
+            GraphOutput::List((name, list)) => {
+                input.insert(name, list);
+            }
+        }
+        edge_data.state.set(EdgeState::Resolved);
     }
 
     match &dag[node_index] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
         },
-        _ => unreachable!(),
+        DagrNode::List(name) => {
+            Ok(GraphOutput::List((name, input.into_values().flatten().collect())))
+        },
     }
 }
 
@@ -161,7 +192,7 @@ fn input_files(_state: &State, value: String) -> Result<String, minijinja::Error
     Ok(value)
 }
 
-async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'b>) -> DagrResult<'a> {
+async fn execute_container<'a, 'b>(execution: &'a ExecutionInput, input: &DagrInput<'b>) -> GraphResult<'a> {
     let docker = Docker::connect_with_local_defaults()?;
     let opts = CreateContainerOptions {
         name: execution.name.as_str(),
@@ -172,37 +203,27 @@ async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'
     env.add_template(&execution.name, &execution.cmd)?;
     env.add_function("fetch_files", input_files);
     // TODO: put PathBuf to String conversion in template function
-    let mut container_input: HashMap<String, String> = HashMap::new();
-    for (k, v) in input.iter() {
-        match v {
-            DagrValue::Files(_) => {
-                container_input.insert(
-                    k.to_string(),
-                    v.to_string(),
-                )
-            },
-            DagrValue::Literal(_) => container_input.insert(k.to_string(), v.to_string()),
-        };
-
+    let mut template_input: HashMap<String, String> = HashMap::new();
+    for (key, output_values) in input.iter() {
+        template_input.insert(
+            key.to_string(),
+            output_values
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<String>>()
+                .join(" "));
     }
 
-    let cmd = env.get_template(&execution.name)?.render(container_input)?;
+    let cmd = env.get_template(&execution.name)?.render(template_input)?;
     let mut binds: Vec<String> = input
         .values()
-        .filter_map(|val| match val {
-            DagrValue::Files(files) => {
-                Some(files
-                    .iter()
-                    .map(|file| format!(
-                            "{}:/inputs/{}:ro",
-                            file.to_string_lossy(),
-                            file.file_name().unwrap().to_string_lossy()))
-                    .collect::<Vec<String>>())
-            },
-            _ => None,
-        })
-        .flatten()
-        .collect();
+        .flat_map(|output_values| output_values
+                  .iter()
+                  .filter_map(|output_value| match output_value {
+                      DagrValue::File(_) => Some(output_value.bind_mount()),
+                      _ => None,
+                  }))
+    .collect();
 
     binds.push(format!("{}:/workdir", execution.workdir));
     let config: Config<&str> = Config {
@@ -230,13 +251,13 @@ async fn execute_container<'a, 'b>(execution: &'a Execution, input: &DagrInput<'
 
     let response = &responses[0];
 
-    Ok(DagrData {
+    Ok(GraphOutput::Execution(ExecutionOutput {
         name: &execution.name,
         exit_code: response.status_code,
         files: std::fs::read_dir(execution.workdir.clone())?
             .map(|dir| DagrFile { path: dir.unwrap().path(), bytes: 0, checksum: 0 } )
             .collect(),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -264,11 +285,19 @@ mod tests {
     #[tokio::test]
     async fn test_single_static_execution() -> Result<(), Box<dyn std::error::Error>> {
         let name = "test_static_exec";
-        let static_execution = Execution::new(name.to_string(), "echo foo".to_string());
+        let static_execution = ExecutionInput::new(name.to_string(), "echo foo".to_string());
         let input = DagrInput::new();
         let result = execute_container(&static_execution, &input).await;
         match result {
-            Ok(r) => assert_eq!(r.exit_code, 0),
+            Ok(r) => {
+                match r {
+                    GraphOutput::List(_) => {
+                        cleanup(vec!(name.to_owned())).await?;
+                        panic!("Expected execution output, got List!")
+                    },
+                    GraphOutput::Execution(output) => assert_eq!(output.exit_code, 0),
+                };
+            },
             Err(e) => {
                 cleanup(vec!(name.to_owned())).await?;
                 panic!("{e}")
@@ -281,18 +310,24 @@ mod tests {
     #[tokio::test]
     async fn test_single_dynamic_literal() -> Result<(), Box<dyn std::error::Error>> {
         let name = "test_dynamic_exec";
-        let dynamic_execution = Execution::new(name.to_string(), "echo {{ literal_val }}".to_string());
+        let dynamic_execution = ExecutionInput::new(name.to_string(), "echo {{ literal_val }}".to_string());
         let mut input = DagrInput::new();
-        input.insert("literal_val", DagrValue::Literal("dynamic".to_string()));
+        input.insert("literal_val", vec!(DagrValue::Literal("dynamic".to_string())));
         let result = execute_container(&dynamic_execution, &input).await;
-        let docker = Docker::connect_with_local_defaults().unwrap();
-        let info = docker.inspect_container(name, Some(InspectContainerOptions{..Default::default()})).await.unwrap();
-        assert_eq!(info.args, Some(vec!["-c".to_string(), "echo dynamic".to_string()]));
         // TODO: learn streams
         // docker.logs(name, Some(LogsOptions { stdout: true, ..Default::default() })).try_collect();
         match result {
             Ok(r) => {
-                assert_eq!(r.exit_code, 0);
+                let docker = Docker::connect_with_local_defaults().unwrap();
+                let info = docker.inspect_container(name, Some(InspectContainerOptions{..Default::default()})).await.unwrap();
+                assert_eq!(info.args, Some(vec!["-c".to_string(), "echo dynamic".to_string()]));
+                match r {
+                    GraphOutput::List(_) => {
+                        cleanup(vec!(name.to_owned())).await?;
+                        panic!("Expected execution output, got List!")
+                    },
+                    GraphOutput::Execution(output) => assert_eq!(output.exit_code, 0),
+                };
             },
             Err(e) => {
                 cleanup(vec!(name.to_owned())).await?;
@@ -306,17 +341,22 @@ mod tests {
     #[tokio::test]
     async fn test_single_static_file_output() -> Result<(), Box<dyn std::error::Error>> {
         let name = "test_static_file_output";
-        let execution = Execution::new(name.to_string(), "echo foo > output.txt".to_string());
+        let execution = ExecutionInput::new(name.to_string(), "echo foo > output.txt".to_string());
         let input = DagrInput::new();
         let result = execute_container(&execution, &input).await;
         let verification = match result {
             Ok(r) => {
-                r.exit_code.eq(&0) &&
-                r.files[0].path.eq(&PathBuf::from(format!("{}/output.txt", execution.workdir)))
+                match r {
+                    GraphOutput::List(_) => false,
+                    GraphOutput::Execution(exec) => {
+                        exec.exit_code.eq(&0) &&
+                            exec.files[0].path.eq(&PathBuf::from(format!("{}/output.txt", execution.workdir)))
+                    }
+                }
             },
-            Err(e) => {
+            Err(_) => {
                 cleanup(vec!(name.to_owned())).await?;
-                panic!("{e}")
+                false
             },
         };
         cleanup(vec!(name.to_owned())).await?;
@@ -330,12 +370,12 @@ mod tests {
             let mut dag = DagrGraph::new();
 
             let name = "chain_last";
-            let i_input = Execution::new(name.to_string(), "echo \"hello $(cat {{ fetch_files(chain_first) }})\" > foo.txt".to_string());
+            let i_input = ExecutionInput::new(name.to_string(), "echo \"hello $(cat {{ fetch_files(chain_first) }})\" > result.txt".to_string());
             let root_idx = dag.add_node(DagrNode::Processor(i_input));
 
             let name = "chain_first";
-            let inner_cmd = "echo 'world' > foo.txt";
-            let input = Execution::new(name.to_string(), inner_cmd.to_string());
+            let inner_cmd = "echo 'world' > result.txt";
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
             dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
 
             Ok((dag, root_idx))
@@ -355,13 +395,13 @@ mod tests {
             let mut dag = DagrGraph::new();
 
             let name = "chain2_last";
-            let i_input = Execution::new(name.to_string(), "cat {{ fetch_files(chain2_first) }} > foo.txt".to_string());
+            let i_input = ExecutionInput::new(name.to_string(), "cat {{ fetch_files(chain2_first) }} > result.txt".to_string());
             let root_idx = dag.add_node(DagrNode::Processor(i_input));
 
             let name = "chain2_first";
             let inner_cmd = "echo 'hello' > hello.txt; echo 'world' > world.txt;";
             // let inner_cmd = "echo world > world.txt; echo hello > hello.txt;";
-            let input = Execution::new(name.to_string(), inner_cmd.to_string());
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
             dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
 
             Ok((dag, root_idx))
@@ -375,13 +415,81 @@ mod tests {
         Ok(())
     }
 
-    fn verify_result(result: DagrResult, valid_file_content: &str) -> Result<bool, DagrError> {
-        let r = result?;
-        let result_file = &r.files[0].path;
-        assert_eq!(r.exit_code, 0);
-        assert_eq!(result_file, &PathBuf::from(format!("{}/{}/foo.txt", DATADIR, r.name)));
-        let file_content = std::fs::read_to_string(result_file)?;
-        assert_eq!(file_content, valid_file_content);
+    #[tokio::test]
+    async fn test_multinode_chain() -> Result<(), Box<dyn std::error::Error>> {
+        fn chain_graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Error>> {
+            let mut dag = DagrGraph::new();
+
+            let name = "chain3_root";
+            // TODO: write test case that ensures a descriptive error is produced from this case:
+            // let cmd = "cat {{ fetch_files(chain3_child1) fetch_files(chain3_child2) }} > result.txt".to_string();
+            let cmd = "cat {{ fetch_files(chain3_child1) }} {{ fetch_files(chain3_child2) }} > result.txt".to_string();
+            let i_input = ExecutionInput::new(name.to_string(), cmd);
+            let root_idx = dag.add_node(DagrNode::Processor(i_input));
+
+            let name = "chain3_child1";
+            let inner_cmd = "echo 'hello' > hello.txt";
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+
+            let name = "chain3_child2";
+            let inner_cmd = "echo 'world' > world.txt";
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+
+            Ok((dag, root_idx))
+        }
+
+        let (dag, root_idx) = chain_graph().unwrap();
+        let result = process_graph(&dag, root_idx).await;
+        let verification = verify_result(result, "hello\nworld\n").unwrap_or(false);
+        cleanup(dag_containers(&dag)?).await?;
+        assert!(verification);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_node() -> Result<(), Box<dyn std::error::Error>> {
+        fn graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Error>> {
+            let mut dag = DagrGraph::new();
+
+            let name = "root";
+            let outer_cmd = "cat {{ fetch_files(l1) }} > result.txt";
+            let input = ExecutionInput::new(name.to_string(), outer_cmd.to_string());
+            let root_idx = dag.add_node(DagrNode::Processor(input));
+            let (_, list_node_idx) = dag.add_child(root_idx, DagrEdge::new(), DagrNode::List("l1".to_string()));
+
+            let name = "list_element_1";
+            let inner_cmd = "echo 'hello' > hello.txt";
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+            dag.add_child(list_node_idx, DagrEdge::new(), DagrNode::Processor(input));
+
+            let name = "list_element_2";
+            let inner_cmd = "echo 'world' > world.txt";
+            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+            dag.add_child(list_node_idx, DagrEdge::new(), DagrNode::Processor(input));
+
+            Ok((dag, root_idx))
+        }
+        let (dag, root_idx) = graph().unwrap();
+        let result = process_graph(&dag, root_idx).await;
+        let verification = verify_result(result, "hello\nworld\n").unwrap_or(false);
+        cleanup(dag_containers(&dag)?).await?;
+        assert!(verification);
+        Ok(())
+    }
+
+    fn verify_result(result: GraphResult, valid_file_content: &str) -> Result<bool, DagrError> {
+        match result? {
+            GraphOutput::Execution(r) => {
+                let result_file = &r.files[0].path;
+                assert_eq!(r.exit_code, 0);
+                assert_eq!(result_file, &PathBuf::from(format!("{}/{}/result.txt", DATADIR, r.name)));
+                let file_content = std::fs::read_to_string(result_file)?;
+                assert_eq!(file_content, valid_file_content);
+            },
+            GraphOutput::List(_) => unimplemented!(),
+        }
         Ok(true)
     }
 
