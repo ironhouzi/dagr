@@ -76,32 +76,58 @@ impl DagrValue {
 
 #[derive(Debug)]
 pub enum DagrNode {
-    List(String),
+    List(ListInput),
     Processor(ExecutionInput),
 }
 
+#[derive(Debug)]
+pub struct ListInput {
+    name: String,
+}
+
+impl ListInput {
+    fn new(name: String, dag: &mut DagrGraph, list_items: Vec<DagrNode>) -> daggy::NodeIndex {
+        let this_node_index = dag.add_node(DagrNode::List(Self { name }));
+        let mut counter = 0;
+        for list_element_node in list_items.into_iter() {
+            let edge = DagrEdge::new(Some(EdgeData{ key: None, value: counter.to_string() }));
+            dag.add_child(this_node_index, edge, list_element_node);
+            counter += 1;
+        }
+
+        this_node_index
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum EdgeState {
+enum EdgeStatus {
     Resolved,
     Unresolved,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EdgeData {
+    key: Option<String>,
+    value: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DagrEdge {
     // Used simple solution of interior mutability, which should be fine assuming docker containers
     // are async and will not traverse thread boundaries to handle execution.
-    state: Cell<EdgeState>,
+    status: Cell<EdgeStatus>,
+    data: Option<EdgeData>,
 }
 
 impl DagrEdge {
-    pub fn new() -> Self {
-        Self { state: Cell::new(EdgeState::Unresolved) }
+    pub fn new(data: Option<EdgeData>) -> Self {
+        Self { status: Cell::new(EdgeStatus::Unresolved), data }
     }
 }
 
 impl Default for DagrEdge {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -149,6 +175,7 @@ pub struct ExecutionOutput<'a> {
 #[async_recursion(?Send)]
 pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> GraphResult {
     let mut input: DagrInput = HashMap::new();
+    let foobar: u8 = dag.children(node_index);
 
     for (child_edge_index, child_node_index) in dag.children(node_index).iter(dag) {
         let edge_data = match dag.edge_weight(child_edge_index) {
@@ -156,7 +183,7 @@ pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> Gra
             None => continue,
         };
 
-        if edge_data.state.get() == EdgeState::Resolved {
+        if edge_data.status.get() == EdgeStatus::Resolved {
             continue
         }
 
@@ -174,15 +201,16 @@ pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> Gra
                 input.insert(name, list);
             }
         }
-        edge_data.state.set(EdgeState::Resolved);
+        // TODO: Determine edge state from ExecutionOutput.exit_code
+        edge_data.status.set(EdgeStatus::Resolved);
     }
 
     match &dag[node_index] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
         },
-        DagrNode::List(name) => {
-            Ok(GraphOutput::List((name, input.into_values().flatten().collect())))
+        DagrNode::List(list_data) => {
+            Ok(GraphOutput::List((&list_data.name, input.into_values().flatten().collect())))
         },
     }
 }
@@ -315,7 +343,6 @@ mod tests {
         input.insert("literal_val", vec!(DagrValue::Literal("dynamic".to_string())));
         let result = execute_container(&dynamic_execution, &input).await;
         // TODO: learn streams
-        // docker.logs(name, Some(LogsOptions { stdout: true, ..Default::default() })).try_collect();
         match result {
             Ok(r) => {
                 let docker = Docker::connect_with_local_defaults().unwrap();
@@ -376,7 +403,7 @@ mod tests {
             let name = "chain_first";
             let inner_cmd = "echo 'world' > result.txt";
             let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+            dag.add_child(root_idx, DagrEdge::default(), DagrNode::Processor(input));
 
             Ok((dag, root_idx))
         }
@@ -402,7 +429,7 @@ mod tests {
             let inner_cmd = "echo 'hello' > hello.txt; echo 'world' > world.txt;";
             // let inner_cmd = "echo world > world.txt; echo hello > hello.txt;";
             let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+            dag.add_child(root_idx, DagrEdge::default(), DagrNode::Processor(input));
 
             Ok((dag, root_idx))
         }
@@ -430,12 +457,12 @@ mod tests {
             let name = "chain3_child1";
             let inner_cmd = "echo 'hello' > hello.txt";
             let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+            dag.add_child(root_idx, DagrEdge::default(), DagrNode::Processor(input));
 
             let name = "chain3_child2";
             let inner_cmd = "echo 'world' > world.txt";
             let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(root_idx, DagrEdge::new(), DagrNode::Processor(input));
+            dag.add_child(root_idx, DagrEdge::default(), DagrNode::Processor(input));
 
             Ok((dag, root_idx))
         }
@@ -453,22 +480,25 @@ mod tests {
         fn graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Error>> {
             let mut dag = DagrGraph::new();
 
-            let name = "root";
-            let outer_cmd = "cat {{ fetch_files(l1) }} > result.txt";
-            let input = ExecutionInput::new(name.to_string(), outer_cmd.to_string());
-            let root_idx = dag.add_node(DagrNode::Processor(input));
-            let (_, list_node_idx) = dag.add_child(root_idx, DagrEdge::new(), DagrNode::List("l1".to_string()));
-
             let name = "list_element_1";
             let inner_cmd = "echo 'hello' > hello.txt";
-            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(list_node_idx, DagrEdge::new(), DagrNode::Processor(input));
+            let input1 = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
 
             let name = "list_element_2";
             let inner_cmd = "echo 'world' > world.txt";
-            let input = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
-            dag.add_child(list_node_idx, DagrEdge::new(), DagrNode::Processor(input));
+            let input2 = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
 
+            let list_node_idx = ListInput::new(
+                "results".to_string(),
+                &mut dag,
+                vec![DagrNode::Processor(input1), DagrNode::Processor(input2)]);
+
+            let name = "root";
+            let outer_cmd = "cat {{ fetch_files(results) }} > result.txt";
+            let input = ExecutionInput::new(name.to_string(), outer_cmd.to_string());
+            let root_idx = dag.add_node(DagrNode::Processor(input));
+
+            dag.add_edge(root_idx, list_node_idx, DagrEdge::default());
             Ok((dag, root_idx))
         }
         let (dag, root_idx) = graph().unwrap();
