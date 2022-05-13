@@ -35,7 +35,6 @@ pub type GraphResult<'a> = Result<GraphOutput<'a>, DagrError>;
 type DagrGraph = Dag::<DagrNode, DagrEdge, u32>;
 type DagrInput<'a> = HashMap<&'a str, Vec<DagrValue>>;
 
-#[derive(Debug)]
 pub enum GraphOutput<'a> {
     Execution(ExecutionOutput<'a>),
     List((&'a str, Vec<DagrValue>)),
@@ -76,27 +75,18 @@ impl DagrValue {
 
 #[derive(Debug)]
 pub enum DagrNode {
-    List(ListInput),
+    List(String),
     Processor(ExecutionInput),
 }
 
-#[derive(Debug)]
-pub struct ListInput {
-    name: String,
-}
-
-impl ListInput {
-    fn new(name: String, dag: &mut DagrGraph, list_items: Vec<DagrNode>) -> daggy::NodeIndex {
-        let this_node_index = dag.add_node(DagrNode::List(Self { name }));
-        let mut counter = 0;
-        for list_element_node in list_items.into_iter() {
-            let edge = DagrEdge::new(Some(EdgeData{ key: None, value: counter.to_string() }));
-            dag.add_child(this_node_index, edge, list_element_node);
-            counter += 1;
-        }
-
-        this_node_index
+pub fn new_list_node(name: String, dag: &mut DagrGraph, list_items: Vec<DagrNode>) -> daggy::NodeIndex {
+    let this_node_index = dag.add_node(DagrNode::List(name));
+    for (counter, list_element_node) in list_items.into_iter().enumerate() {
+        let edge = DagrEdge::new(Some(EdgeData{ key: None, value: counter.to_string() }));
+        dag.add_child(this_node_index, edge, list_element_node);
     }
+
+    this_node_index
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,7 +142,6 @@ impl ExecutionInput {
     }
 }
 
-#[derive(Debug)]
 struct DagrFile {
     path: PathBuf,
     bytes: usize,
@@ -165,7 +154,6 @@ impl Display for DagrFile {
     }
 }
 
-#[derive(Debug)]
 pub struct ExecutionOutput<'a> {
     name: &'a str,
     exit_code: i64,
@@ -175,15 +163,16 @@ pub struct ExecutionOutput<'a> {
 #[async_recursion(?Send)]
 pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> GraphResult {
     let mut input: DagrInput = HashMap::new();
-    let foobar: u8 = dag.children(node_index);
+    let mut ordered_list_input: Vec<(usize, &str)> = Vec::new();
+    let is_ordered = matches!(&dag[node_index], DagrNode::List(_));
 
     for (child_edge_index, child_node_index) in dag.children(node_index).iter(dag) {
-        let edge_data = match dag.edge_weight(child_edge_index) {
-            Some(edge) => edge,
+        let edge = match dag.edge_weight(child_edge_index) {
+            Some(e) => e,
             None => continue,
         };
 
-        if edge_data.status.get() == EdgeStatus::Resolved {
+        if edge.status.get() == EdgeStatus::Resolved {
             continue
         }
 
@@ -196,21 +185,34 @@ pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> Gra
                         .map(|f| DagrValue::File(f.path.clone()))
                         .collect()
                 );
+                if is_ordered {
+                    let edge_data = &edge.data;
+                    let order = edge_data
+                        .as_ref()
+                        .map_or(usize::MAX, |data| data.value.parse::<usize>().unwrap_or(usize::MAX));
+
+                    ordered_list_input.push((order, result.name));
+                }
             },
             GraphOutput::List((name, list)) => {
                 input.insert(name, list);
             }
         }
         // TODO: Determine edge state from ExecutionOutput.exit_code
-        edge_data.status.set(EdgeStatus::Resolved);
+        edge.status.set(EdgeStatus::Resolved);
     }
 
     match &dag[node_index] {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
         },
-        DagrNode::List(list_data) => {
-            Ok(GraphOutput::List((&list_data.name, input.into_values().flatten().collect())))
+        DagrNode::List(list_name) => {
+            let mut sorted_input: Vec<DagrValue> = Vec::new();
+            ordered_list_input.sort_unstable();
+            for (_, key) in ordered_list_input {
+                sorted_input.extend_from_slice(&input[&key]);
+            }
+            Ok(GraphOutput::List((list_name, sorted_input)))
         },
     }
 }
@@ -488,7 +490,7 @@ mod tests {
             let inner_cmd = "echo 'world' > world.txt";
             let input2 = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
 
-            let list_node_idx = ListInput::new(
+            let list_node_idx = new_list_node(
                 "results".to_string(),
                 &mut dag,
                 vec![DagrNode::Processor(input1), DagrNode::Processor(input2)]);
@@ -498,7 +500,7 @@ mod tests {
             let input = ExecutionInput::new(name.to_string(), outer_cmd.to_string());
             let root_idx = dag.add_node(DagrNode::Processor(input));
 
-            dag.add_edge(root_idx, list_node_idx, DagrEdge::default());
+            dag.add_edge(root_idx, list_node_idx, DagrEdge::default())?;
             Ok((dag, root_idx))
         }
         let (dag, root_idx) = graph().unwrap();
