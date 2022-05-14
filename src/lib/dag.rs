@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::cell::Cell;
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -10,26 +12,22 @@ use bollard::Docker;
 use bollard::container::{
     Config,
     CreateContainerOptions,
-    // LogsOptions,
+    LogOutput,
+    LogsOptions,
     StartContainerOptions,
     WaitContainerOptions,
 };
 use bollard::models::HostConfig;
-// use daggy::petgraph::graph::node_index;
 use daggy::{Dag, Walker};
-// use futures_util::Future;
 
-// use std::hash::Hash;
 use futures_util::stream::TryStreamExt;
-// use futures_util::future::join_all;
 use minijinja::{Environment, Source, State};
 use serde::Serialize;
+use tokio_stream::StreamExt;
 
 use crate::error::DagrError;
 
-// type DagrError = Box<dyn Error + 'static>;
 const DATADIR: &str = "/tmp/dagr/data";
-// const SLEEP: u32 = 4;
 
 pub type GraphResult<'a> = Result<GraphOutput<'a>, DagrError>;
 type DagrGraph = Dag::<DagrNode, DagrEdge, u32>;
@@ -276,9 +274,33 @@ async fn execute_container<'a, 'b>(execution: &'a ExecutionInput, input: &DagrIn
     println!("Await ({})", execution.name);
     docker.start_container(&execution.name, None::<StartContainerOptions<String>>).await?;
     let wait_opts = Some(WaitContainerOptions { condition: "not-running" });
-    let responses = docker.wait_container(&execution.name, wait_opts).try_collect::<Vec<_>>().await?;
-    println!("Done ({})", execution.name);
+    let responses = docker
+        .wait_container(&execution.name, wait_opts)
+        .try_collect::<Vec<_>>()
+        .await?;
 
+    let log_options = Some(LogsOptions::<String> {
+        stdout: true,
+        ..Default::default()
+    });
+    let mut log_stream = docker.logs(&execution.name, log_options);
+    while let Some(log_entry) = log_stream.next().await {
+        match log_entry? {
+            LogOutput::StdOut{message} => {
+                if let Ok(valid_utf8) = String::from_utf8(message.to_vec()) {
+                    // TODO: format container log to distinguish from application log
+                    println!("    -- Container stdout -- {}",
+                             valid_utf8.strip_suffix('\n').unwrap_or(&valid_utf8))
+                } else {
+                    continue
+                }
+            },
+            // TODO: stderr
+            _ => continue,
+        }
+    }
+
+    println!("Done ({})", execution.name);
     let response = &responses[0];
 
     Ok(GraphOutput::Execution(ExecutionOutput {
