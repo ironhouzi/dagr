@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![allow(dead_code, unused_variables)]
 
 use std::cell::Cell;
 use std::fmt::Display;
@@ -18,6 +18,7 @@ use bollard::container::{
     WaitContainerOptions,
 };
 use bollard::models::HostConfig;
+use daggy::petgraph::visit::WalkerIter;
 use daggy::{Dag, Walker};
 
 use futures_util::stream::TryStreamExt;
@@ -32,6 +33,8 @@ const DATADIR: &str = "/tmp/dagr/data";
 pub type GraphResult<'a> = Result<GraphOutput<'a>, DagrError>;
 type DagrGraph = Dag::<DagrNode, DagrEdge, u32>;
 type DagrInput<'a> = HashMap<&'a str, Vec<DagrValue>>;
+
+// type NodeIteration = (daggy::EdgeIndex, daggy::NodeIndex);
 
 pub enum GraphOutput<'a> {
     Execution(ExecutionOutput<'a>),
@@ -72,15 +75,37 @@ impl DagrValue {
 }
 
 #[derive(Debug)]
+pub struct MapNode {
+    name: String,
+}
+
+#[derive(Debug)]
 pub enum DagrNode {
     List(String),
+    Map(MapNode),
+    MapInput,
     Processor(ExecutionInput),
+}
+
+pub fn new_map_node(
+    name: String,
+    dag: &mut DagrGraph,
+    fn_node_idx: daggy::NodeIndex,
+    list_node_idx: daggy::NodeIndex,
+) -> Result<daggy::NodeIndex, Box<dyn std::error::Error>> {
+    let this_node_index = dag.add_node(DagrNode::Map(MapNode {name}));
+    let fn_edge = DagrEdge::new(Some(EdgeData{ _type: Some(EdgeDataType::Ordered), value: "0".to_string() }));
+    let list_edge = DagrEdge::new(Some(EdgeData{ _type: Some(EdgeDataType::Ordered), value: "1".to_string() }));
+    dag.add_edge(this_node_index, fn_node_idx, fn_edge)?;
+    dag.add_child(fn_node_idx, DagrEdge::default(), DagrNode::MapInput);
+    dag.add_edge(this_node_index, list_node_idx, list_edge)?;
+    Ok(this_node_index)
 }
 
 pub fn new_list_node(name: String, dag: &mut DagrGraph, list_items: Vec<DagrNode>) -> daggy::NodeIndex {
     let this_node_index = dag.add_node(DagrNode::List(name));
     for (counter, list_element_node) in list_items.into_iter().enumerate() {
-        let edge = DagrEdge::new(Some(EdgeData{ key: None, value: counter.to_string() }));
+        let edge = DagrEdge::new(Some(EdgeData{ _type: None, value: counter.to_string() }));
         dag.add_child(this_node_index, edge, list_element_node);
     }
 
@@ -95,8 +120,13 @@ enum EdgeStatus {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeData {
-    key: Option<String>,
+    _type: Option<EdgeDataType>,
     value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum EdgeDataType {
+    Ordered,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -118,6 +148,13 @@ impl Default for DagrEdge {
         Self::new(None)
     }
 }
+
+// #[derive(Clone, Debug)]
+// pub struct MapInput {
+//     name: String,
+//     fn_node_idx: daggy::NodeIndex,
+//     list_node_idx: daggy::NodeIndex,
+// }
 
 #[derive(Clone, Debug)]
 pub struct ExecutionInput {
@@ -160,11 +197,27 @@ pub struct ExecutionOutput<'a> {
 
 #[async_recursion(?Send)]
 pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> GraphResult {
+    let current_node = &dag[node_index];
     let mut input: DagrInput = HashMap::new();
     let mut ordered_list_input: Vec<(usize, &str)> = Vec::new();
-    let is_ordered = matches!(&dag[node_index], DagrNode::List(_));
+    let is_ordered = matches!(current_node, DagrNode::List(_));
 
-    for (child_edge_index, child_node_index) in dag.children(node_index).iter(dag) {
+    let child_iter = if matches!(current_node, DagrNode::Map(_)) {
+        let fns = daggy::walker::Filter::new(dag.children(node_index), |_, &(e, _)| {
+            let edge_data = dag.edge_weight(e).unwrap().data.as_ref().unwrap();
+            edge_data._type == Some(EdgeDataType::Ordered) && edge_data.value.parse::<usize>().unwrap() == 0
+        });
+        let lst = daggy::walker::Filter::new(dag.children(node_index), |_, &(e, _)| {
+            let edge_data = dag.edge_weight(e).unwrap().data.as_ref().unwrap();
+            edge_data._type == Some(EdgeDataType::Ordered) && edge_data.value.parse::<usize>().unwrap() == 1
+        });
+        let mut chain = daggy::walker::Chain::new(fns, lst);
+        chain.iter(dag)
+    } else {
+        dag.children(node_index).iter(dag) 
+    };
+
+    for (child_edge_index, child_node_index) in child_iter {
         let edge = match dag.edge_weight(child_edge_index) {
             Some(e) => e,
             None => continue,
@@ -194,24 +247,31 @@ pub async fn process_graph(dag: &DagrGraph, node_index: daggy::NodeIndex) -> Gra
             },
             GraphOutput::List((name, list)) => {
                 input.insert(name, list);
-            }
+            },
         }
         // TODO: Determine edge state from ExecutionOutput.exit_code
         edge.status.set(EdgeStatus::Resolved);
     }
 
-    match &dag[node_index] {
+    match current_node {
         DagrNode::Processor(exec) => {
             execute_container(exec, &input).await
         },
-        DagrNode::List(list_name) => {
+        DagrNode::List(node_name) => {
             let mut sorted_input: Vec<DagrValue> = Vec::new();
             ordered_list_input.sort_unstable();
             for (_, key) in ordered_list_input {
                 sorted_input.extend_from_slice(&input[&key]);
             }
-            Ok(GraphOutput::List((list_name, sorted_input)))
+            Ok(GraphOutput::List((node_name, sorted_input)))
         },
+        DagrNode::Map(map_node) => {
+            Ok(GraphOutput::List((&map_node.name, vec![])))
+        }
+        DagrNode::MapInput => {
+            todo!()
+            // Ok(GraphOutput::List((node_name, vec![])))
+        }
     }
 }
 
@@ -343,11 +403,11 @@ mod tests {
         match result {
             Ok(r) => {
                 match r {
-                    GraphOutput::List(_) => {
-                        cleanup(vec!(name.to_owned())).await?;
-                        panic!("Expected execution output, got List!")
-                    },
                     GraphOutput::Execution(output) => assert_eq!(output.exit_code, 0),
+                    _ => {
+                        cleanup(vec!(name.to_owned())).await?;
+                        panic!("Expected execution output")
+                    },
                 };
             },
             Err(e) => {
@@ -373,11 +433,11 @@ mod tests {
                 let info = docker.inspect_container(name, Some(InspectContainerOptions{..Default::default()})).await.unwrap();
                 assert_eq!(info.args, Some(vec!["-c".to_string(), "echo dynamic".to_string()]));
                 match r {
-                    GraphOutput::List(_) => {
-                        cleanup(vec!(name.to_owned())).await?;
-                        panic!("Expected execution output, got List!")
-                    },
                     GraphOutput::Execution(output) => assert_eq!(output.exit_code, 0),
+                    _ => {
+                        cleanup(vec!(name.to_owned())).await?;
+                        panic!("Expected execution output")
+                    },
                 };
             },
             Err(e) => {
@@ -398,11 +458,11 @@ mod tests {
         let verification = match result {
             Ok(r) => {
                 match r {
-                    GraphOutput::List(_) => false,
                     GraphOutput::Execution(exec) => {
                         exec.exit_code.eq(&0) &&
                             exec.files[0].path.eq(&PathBuf::from(format!("{}/output.txt", execution.workdir)))
                     }
+                    _ => false,
                 }
             },
             Err(_) => {
@@ -533,6 +593,42 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_map_node() -> Result<(), Box<dyn std::error::Error>> {
+        fn graph() -> Result<(DagrGraph, daggy::NodeIndex), Box<dyn std::error::Error>> {
+            let mut dag = DagrGraph::new();
+
+            let name = "english";
+            let inner_cmd = "echo 'hello' > hello.txt";
+            let input1 = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+
+            let name = "norwegian";
+            let inner_cmd = "echo 'hei' > hei.txt";
+            let input2 = ExecutionInput::new(name.to_string(), inner_cmd.to_string());
+
+            let list_node_idx = new_list_node(
+                "results".to_string(),
+                &mut dag,
+                vec![DagrNode::Processor(input1), DagrNode::Processor(input2)]);
+
+            let name = "fn_node";
+            let outer_cmd = "cat {{ fetch_files(map_input) }} - <<(echo you) > result.txt";
+            let input = ExecutionInput::new(name.to_string(), outer_cmd.to_string());
+            let fn_node_idx = dag.add_node(DagrNode::Processor(input));
+
+            let name = "root";
+            let root_idx = new_map_node(name.to_string(), &mut dag, fn_node_idx, list_node_idx)?;
+
+            Ok((dag, root_idx))
+        }
+        let (dag, root_idx) = graph().unwrap();
+        let result = process_graph(&dag, root_idx).await;
+        let verification = verify_result(result, "hello\nworld\n").unwrap_or(false);
+        cleanup(dag_containers(&dag)?).await?;
+        assert!(verification);
+        Ok(())
+    }
+
     fn verify_result(result: GraphResult, valid_file_content: &str) -> Result<bool, DagrError> {
         match result? {
             GraphOutput::Execution(r) => {
@@ -542,7 +638,9 @@ mod tests {
                 let file_content = std::fs::read_to_string(result_file)?;
                 assert_eq!(file_content, valid_file_content);
             },
-            GraphOutput::List(_) => unimplemented!(),
+            GraphOutput::List(l) => {
+                dbg!(l);
+            },
         }
         Ok(true)
     }
